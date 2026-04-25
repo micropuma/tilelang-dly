@@ -70,6 +70,7 @@ def ref_dequant_matmul(A: torch.Tensor, B: torch.Tensor):
     return torch.matmul(input=A, other=B_dequantized)
 
 
+# B是量化过的，是权重量化
 @tilelang.jit
 def tl_dequant_matmul(A, B, BLOCK_M: int, BLOCK_N: int, BLOCK_K: int):
     M, N, K = T.const("M, N, K")
@@ -81,6 +82,30 @@ def tl_dequant_matmul(A, B, BLOCK_M: int, BLOCK_N: int, BLOCK_K: int):
     accum_dtype = T.float32
 
     # TODO: Implement this function
+    with T.Kernel(T.ceildiv(M, BLOCK_M), T.ceildiv(N, BLOCK_N)) as (bx, by):
+        row_idx = bx * BLOCK_M  
+        col_idx = by * BLOCK_N  
+
+        A_mem = T.alloc_shared((BLOCK_M, BLOCK_K), A_dtype)
+        B_mem = T.alloc_shared((BLOCK_K, BLOCK_N // 2), B_storage_dtype)
+        B_dequantized = T.alloc_shared((BLOCK_K, BLOCK_N), A_dtype)
+        C_reg = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
+
+        T.clear(C_reg)
+
+        for k in T.Pipelined(K // BLOCK_K, num_stages=3):
+            k_idx = k * BLOCK_K
+            T.copy(A[row_idx, k_idx], A_mem)
+            T.copy(B[k_idx, col_idx // 2], B_mem)
+
+            for i, j in T.Parallel(BLOCK_K, BLOCK_N // 2):
+                B_dequantized[i, j * 2] = T.cast(B_mem[i,j] & 0x0F, dtype=A_dtype) - 8.0
+                B_dequantized[i, j * 2+1] = T.cast((B_mem[i,j]>>4) & 0x0F, dtype=A_dtype) - 8.0
+            
+            T.gemm(A_mem, B_dequantized, C_reg)
+
+        T.copy(C_reg, C[row_idx, col_idx])
+
 
     return C
 

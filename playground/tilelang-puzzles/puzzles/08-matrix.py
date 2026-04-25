@@ -63,6 +63,26 @@ def tl_gemv(A, B, BLOCK_M: int, BLOCK_K: int):
     C = T.empty((M,), dtype)
 
     # TODO: Implement this function
+    with T.Kernel(T.ceildiv(M, BLOCK_M)) as (bx,):
+        row_idx = bx * BLOCK_M  
+
+        A_reg = T.alloc_fragment((BLOCK_M, BLOCK_K), dtype)
+        B_reg = T.alloc_fragment((BLOCK_K,), dtype)
+        C_reg = T.alloc_fragment((BLOCK_M,), accum_dtype)
+        AB_temp = T.alloc_fragment((BLOCK_M, BLOCK_K), accum_dtype)
+
+        T.clear(C_reg)
+
+        for col in T.Serial(K // BLOCK_K):  
+            col_idx = col * BLOCK_K  
+            T.copy(A[row_idx, col_idx], A_reg)
+            T.copy(B[col_idx], B_reg)
+
+            for i, j in T.Parallel(BLOCK_M, BLOCK_K):
+                AB_temp[i,j] = A_reg[i, j].astype(accum_dtype) * B_reg[j].astype(accum_dtype)
+            T.reduce_sum(AB_temp, C_reg, dim=1, clear=False)
+
+        T.copy(C_reg, C[row_idx]) 
     
     return C
 
@@ -218,6 +238,21 @@ def tl_matmul_opt(A, B, BLOCK_M: int, BLOCK_N: int, BLOCK_K: int):
     C = T.empty((M, N), dtype)
 
     # TODO: Implement this function
+    with T.Kernel(T.ceildiv(M, BLOCK_M), T.ceildiv(N, BLOCK_N)) as (bx, by):
+        row_idx = bx * BLOCK_M  
+        col_idx = by * BLOCK_N  
+
+        A_mem = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+        B_mem = T.alloc_shared((BLOCK_K, BLOCK_N), dtype)
+        C_reg = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
+
+        for k in T.Pipelined(K // BLOCK_K, num_stages=3):
+            k_idx = k * BLOCK_K  
+            T.copy(A[row_idx, k_idx], A_mem)
+            T.copy(B[k_idx, col_idx], B_mem)
+            T.gemm(A_mem, B_mem, C_reg)
+        
+        T.copy(C_reg, C[row_idx, col_idx])
 
     return C
 

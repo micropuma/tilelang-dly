@@ -82,6 +82,66 @@ def tl_scalar_flash_attn(Q, K, V, BLOCK_B: int, BLOCK_S: int):
     O = T.empty((B, S), dtype)
 
     # TODO: Implement this function
+    with T.Kernel(B // BLOCK_B, threads=256) as (bx,):  
+        row_idx = bx * BLOCK_B  
+
+        Q_reg = T.alloc_fragment((BLOCK_B, BLOCK_S), dtype)
+        K_reg = T.alloc_fragment((BLOCK_B, BLOCK_S), dtype)
+        V_reg = T.alloc_fragment((BLOCK_B, BLOCK_S), dtype)
+        O_reg = T.alloc_fragment((BLOCK_B, BLOCK_S), dtype)
+
+        # 当前块
+        qk = T.alloc_fragment((BLOCK_B, BLOCK_S), dtype)
+        exp_qk = T.alloc_fragment((BLOCK_B, BLOCK_S), dtype)
+        cur_max = T.alloc_fragment((BLOCK_B,), dtype)
+        cur_sum = T.alloc_fragment((BLOCK_B,), dtype)  
+
+        # 整行
+        final_max = T.alloc_fragment((BLOCK_B,), dtype)  
+        final_sum = T.alloc_fragment((BLOCK_B,), dtype)
+
+        T.fill(final_max, -T.infinity(dtype))
+        T.clear(final_sum)
+
+        for col in T.Serial(S // BLOCK_S):
+            col_idx = col * BLOCK_S
+            T.copy(Q[row_idx, col_idx], Q_reg)
+            T.copy(K[row_idx, col_idx], K_reg)
+            
+            # scalar-flash-attn 是简易版本，qk不是矩阵乘，是逐元素乘
+            for i, j in T.Parallel(BLOCK_B, BLOCK_S):
+                qk[i, j] = Q_reg[i,j] * K_reg[i,j]
+            T.reduce_max(qk, cur_max, dim=1, clear=True)
+
+            # 调整之前的sum
+            for i in T.Parallel(BLOCK_B):
+                prev_max = final_max[i]
+                final_max[i] = T.max(final_max[i], cur_max[i])
+                final_sum[i] = final_sum[i] * T.exp2((prev_max - final_max[i]) * log2_e)
+
+            # 计算exp_qk，并计算cur_sum
+            for i, j in T.Parallel(BLOCK_B, BLOCK_S):
+                exp_qk[i, j] = T.exp2((qk[i,j] - final_max[i]) * log2_e)
+            T.reduce_sum(exp_qk, cur_sum, dim=1, clear=True)   
+
+            # 计算最终的sum
+            for i in T.Parallel(BLOCK_B):
+                final_sum[i] += cur_sum[i]
+
+        for col in T.Serial(S // BLOCK_S):
+            col_idx = col * BLOCK_S  
+            T.copy(Q[row_idx, col_idx], Q_reg)
+            T.copy(K[row_idx, col_idx], K_reg)
+            T.copy(V[row_idx, col_idx], V_reg)
+
+            for i, j in T.Parallel(BLOCK_B, BLOCK_S):
+                # Q,K
+                O_reg[i,j] = (
+                    T.exp2((Q_reg[i,j] * K_reg[i,j] - final_max[i]) * log2_e) /
+                    final_sum[i] * V_reg[i,j]
+                )
+            
+            T.copy(O_reg, O[row_idx, col_idx])
 
     return O
 
